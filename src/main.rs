@@ -13,8 +13,8 @@ use std::{
 use anyhow::Context;
 use base64::Engine;
 use clap::Parser;
-use futures::{future::Either, StreamExt};
-use mini_moka::unsync::Cache;
+use futures::{FutureExt, StreamExt};
+use linked_hash_map::LinkedHashMap;
 use monoio::net::udp::UdpSocket;
 use morf::peer::MorfPeer;
 use rand::Rng;
@@ -121,6 +121,7 @@ struct DeviceState {
   public_key_hash: [u8; 16],
   peer: Rc<RefCell<MorfPeer>>,
   topic: Option<Rc<str>>,
+  created_at: Instant,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -179,16 +180,10 @@ async fn async_main() -> anyhow::Result<()> {
   .with_context(|| "failed to start mqtt client")?;
 
   let mut pkt = vec![0u8; 1500];
-  let mut half_established_sessions: Cache<(SocketAddr, [u8; 32]), DeviceState> = Cache::builder()
-    .max_capacity(100)
-    .time_to_live(Duration::from_secs(5))
-    .build();
-  let sessions: RefCell<Cache<(SocketAddr, [u8; 32]), DeviceState>> = RefCell::new(
-    Cache::builder()
-      .max_capacity(50)
-      .time_to_idle(Duration::from_secs(30))
-      .build(),
-  );
+  let half_established_sessions: RefCell<LinkedHashMap<(SocketAddr, [u8; 32]), DeviceState>> =
+    RefCell::new(LinkedHashMap::new());
+  let sessions: RefCell<LinkedHashMap<(SocketAddr, [u8; 32]), DeviceState>> =
+    RefCell::new(LinkedHashMap::new());
   let downlink = UdpSocket::bind(args.downlink).with_context(|| "Failed to bind downlink")?;
   let uplink =
     Arc::new(UdpSocket::bind(args.uplink_local).with_context(|| "Failed to bind uplink")?);
@@ -198,6 +193,40 @@ async fn async_main() -> anyhow::Result<()> {
     public_key = base64::engine::general_purpose::STANDARD.encode(public_key.as_bytes()),
     "listening for downlink packets"
   );
+
+  let session_eviction_work = async {
+    let mut interval = Duration::from_secs(1);
+    loop {
+      monoio::time::sleep(interval).await;
+      let now = Instant::now();
+      let mut num_evicted_half_established_sessions = 0usize;
+      let mut num_evicted_sessions = 0usize;
+      {
+        let mut half_established_sessions = half_established_sessions.borrow_mut();
+        while let Some(front) = half_established_sessions.front() {
+          if front.1.created_at > now
+            || now.duration_since(front.1.created_at) < Duration::from_secs(5)
+          {
+            break;
+          }
+          half_established_sessions.pop_front();
+          num_evicted_half_established_sessions += 1;
+        }
+      }
+      {
+        let mut sessions = sessions.borrow_mut();
+        while sessions.len() > 50 {
+          sessions.pop_front();
+          num_evicted_sessions += 1;
+        }
+      }
+      let duration = now.elapsed();
+      interval = std::cmp::max(duration * 100, Duration::from_millis(200));
+      if num_evicted_half_established_sessions != 0 || num_evicted_sessions != 0 {
+        tracing::info!(duration = ?duration, interval = ?interval, num_evicted_half_established_sessions, num_evicted_sessions, "session eviction");
+      }
+    }
+  };
 
   let morf2mqtt_work = async {
     loop {
@@ -271,12 +300,13 @@ async fn async_main() -> anyhow::Result<()> {
               .optional()
           })
           .await?;
-          half_established_sessions.insert(
+          half_established_sessions.borrow_mut().insert(
             device_key,
             DeviceState {
               public_key_hash,
               peer: Rc::new(RefCell::new(peer)),
               topic: topic.as_deref().map(Rc::from),
+              created_at: Instant::now(),
             },
           );
 
@@ -315,11 +345,12 @@ async fn async_main() -> anyhow::Result<()> {
               }
             }
             if let Some(key) = key_to_refresh {
-              let _ = sessions.get(&key);
+              sessions.get_refresh(&key);
             }
           }
 
           if output.is_none() {
+            let mut half_established_sessions = half_established_sessions.borrow_mut();
             for entry in half_established_sessions.iter() {
               if entry.0 .0 != remote_addr {
                 continue;
@@ -336,7 +367,7 @@ async fn async_main() -> anyhow::Result<()> {
                   public_key_hash = public_key_hash_b64,
                   "device session established"
                 );
-                half_established_sessions.invalidate(&key);
+                half_established_sessions.remove(&key);
                 sessions.borrow_mut().insert(key, st);
                 break;
               }
@@ -417,18 +448,15 @@ async fn async_main() -> anyhow::Result<()> {
     Ok::<_, anyhow::Error>(())
   };
 
-  let output = match futures::future::try_select(
-    std::pin::pin!(enforce_future_type(morf2mqtt_work)),
-    std::pin::pin!(enforce_future_type(mqtt2morf_work)),
-  )
-  .await
-  {
-    Ok(_) => Ok(()),
-    Err(e) => Err(match e {
-      Either::Left((e, _)) => e.context("morf2mqtt failed"),
-      Either::Right((e, _)) => e.context("mqtt2morf failed"),
-    }),
-  };
+  futures::select_biased! {
+    _ = session_eviction_work.fuse() => unreachable!(),
+    e = enforce_future_type(morf2mqtt_work).fuse() => {
+      e.with_context(|| "morf2mqtt failed")?;
+    }
+    e = enforce_future_type(mqtt2morf_work).fuse() => {
+      e.with_context(|| "mqtt2morf failed")?;
+    }
+  }
 
-  output
+  Ok(())
 }

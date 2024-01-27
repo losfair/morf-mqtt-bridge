@@ -16,10 +16,10 @@ bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 constant_time_eq = "0.3"
 libc = "0.2"
+linked-hash-map = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 futures = "0.3"
-mini-moka = "0.10"
 monoio = { version = "0.2", features = ["sync"] }
 monoio-rustls = "0.3"
 morf = "0.2"
