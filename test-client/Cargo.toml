@@ -1,0 +1,12 @@
+[package]
+name = "test-client"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+morf = { git = "https://github.com/losfair/morf", rev = "034069885776e7295c59d952b0dc7e5a85f735cc" }
+rand = "0.8"
+x25519-dalek = { version = "2", default-features = false }
