@@ -1,2 +1,3 @@
 # morf-mqtt-bridge
-MoRF/MQTT bidirectional bridge
+
+[MoRF](https://github.com/losfair/morf) to MQTT bridge
