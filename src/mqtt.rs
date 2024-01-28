@@ -15,14 +15,16 @@ use monoio::{
   net::TcpStream,
   time::MissedTickBehavior,
 };
+use mqttrs::SubscribeTopic;
 use rand::Rng;
 use rustls::RootCertStore;
 
 use crate::util::{enforce_future_type, OffsetIoBufMut};
 
-pub struct MqttMessage {
-  pub topic: Rc<str>,
-  pub data: Bytes,
+pub enum MqttMessage {
+  Publish { topic: Rc<str>, data: Bytes },
+  Subscribe { topic: String },
+  Unsubscribe { topic: String },
 }
 
 pub struct MqttConfig<'a> {
@@ -198,19 +200,51 @@ async fn worker_once_on_stream(
       let Some(input) = input else {
         return Ok::<_, anyhow::Error>(());
       };
-      let mut output_buf = vec![0u8; 32 + input.topic.as_bytes().len() + input.data.len()];
-      let n = mqttrs::encode_slice(
-        &mqttrs::Packet::Publish(mqttrs::Publish {
-          dup: false,
-          qospid: mqttrs::QosPid::AtMostOnce,
-          retain: false,
-          topic_name: &*input.topic,
-          payload: input.data.as_ref(),
-        }),
-        &mut output_buf,
-      )?;
-      output_buf.truncate(n);
-      wh.write_all(output_buf).await.0?;
+
+      match input {
+        MqttMessage::Publish { topic, data } => {
+          let mut output_buf = vec![0u8; 32 + topic.as_bytes().len() + data.len()];
+          let n = mqttrs::encode_slice(
+            &mqttrs::Packet::Publish(mqttrs::Publish {
+              dup: false,
+              qospid: mqttrs::QosPid::AtMostOnce,
+              retain: false,
+              topic_name: &*topic,
+              payload: data.as_ref(),
+            }),
+            &mut output_buf,
+          )?;
+          output_buf.truncate(n);
+          wh.write_all(output_buf).await.0?;
+        }
+        MqttMessage::Subscribe { topic } => {
+          let mut output_buf = vec![0u8; 32 + topic.as_bytes().len()];
+          let n = mqttrs::encode_slice(
+            &mqttrs::Packet::Subscribe(mqttrs::Subscribe {
+              pid: mqttrs::Pid::new(),
+              topics: vec![SubscribeTopic {
+                topic_path: topic,
+                qos: mqttrs::QoS::AtMostOnce,
+              }],
+            }),
+            &mut output_buf,
+          )?;
+          output_buf.truncate(n);
+          wh.write_all(output_buf).await.0?;
+        }
+        MqttMessage::Unsubscribe { topic } => {
+          let mut output_buf = vec![0u8; 32 + topic.as_bytes().len()];
+          let n = mqttrs::encode_slice(
+            &mqttrs::Packet::Unsubscribe(mqttrs::Unsubscribe {
+              pid: mqttrs::Pid::new(),
+              topics: vec![topic],
+            }),
+            &mut output_buf,
+          )?;
+          output_buf.truncate(n);
+          wh.write_all(output_buf).await.0?;
+        }
+      }
     }
   };
 
@@ -253,7 +287,7 @@ async fn worker_once_on_stream(
           tracing::info!("received ping response");
         }
         mqttrs::Packet::Publish(x) => {
-          match rx_p.try_send(MqttMessage {
+          match rx_p.try_send(MqttMessage::Publish {
             topic: Rc::from(x.topic_name),
             data: Bytes::copy_from_slice(x.payload),
           }) {

@@ -91,8 +91,8 @@ fn main() {
       }
     }
 
-    for _ in 0..10000 {
-      std::thread::sleep(Duration::from_millis(1));
+    for _ in 0..100 {
+      std::thread::sleep(Duration::from_millis(100));
       let mut payload = Vec::from(format!(
         "test {} ",
         SystemTime::now()

@@ -13,7 +13,7 @@ use std::{
 use anyhow::Context;
 use base64::Engine;
 use clap::Parser;
-use futures::{FutureExt, StreamExt};
+use futures::{FutureExt, SinkExt, StreamExt};
 use linked_hash_map::LinkedHashMap;
 use monoio::net::udp::UdpSocket;
 use morf::peer::MorfPeer;
@@ -122,6 +122,7 @@ struct DeviceState {
   peer: Rc<RefCell<MorfPeer>>,
   topic: Option<Rc<str>>,
   created_at: Instant,
+  last_active_at: Instant,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -194,6 +195,8 @@ async fn async_main() -> anyhow::Result<()> {
     "listening for downlink packets"
   );
 
+  let mut mqtt_tx_2 = mqtt_tx.clone();
+
   let session_eviction_work = async {
     let mut interval = Duration::from_secs(1);
     loop {
@@ -225,6 +228,65 @@ async fn async_main() -> anyhow::Result<()> {
       if num_evicted_half_established_sessions != 0 || num_evicted_sessions != 0 {
         tracing::info!(duration = ?duration, interval = ?interval, num_evicted_half_established_sessions, num_evicted_sessions, "session eviction");
       }
+    }
+  };
+
+  let subscription_dispatch_work = async {
+    let mut current_subscriptions: HashSet<String> = HashSet::new();
+    let mut first = true;
+
+    loop {
+      if first {
+        first = false;
+      } else {
+        monoio::time::sleep(Duration::from_secs(5)).await;
+      }
+
+      let db2 = db.clone();
+      let res = blocking::unblock(move || {
+        let db2 = db2.lock().unwrap();
+        let mut new_subscriptions: HashSet<String> = HashSet::new();
+        let mut stmt = db2.prepare_cached("select distinct topic from device_subscribe_topics")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+          let topic: String = row.get(0)?;
+          new_subscriptions.insert(topic);
+        }
+        Ok::<_, anyhow::Error>(new_subscriptions)
+      })
+      .await;
+      let new_subscriptions = match res {
+        Ok(x) => x,
+        Err(error) => {
+          tracing::error!(?error, "failed to query subscriptions");
+          continue;
+        }
+      };
+
+      let added = new_subscriptions.difference(&current_subscriptions);
+      let removed = current_subscriptions.difference(&new_subscriptions);
+
+      for topic in added {
+        tracing::info!(topic, "subscribing to topic");
+        mqtt_tx_2
+          .send(MqttMessage::Subscribe {
+            topic: topic.clone(),
+          })
+          .await
+          .ok();
+      }
+
+      for topic in removed {
+        tracing::info!(topic, "unsubscribing from topic");
+        mqtt_tx_2
+          .send(MqttMessage::Unsubscribe {
+            topic: topic.clone(),
+          })
+          .await
+          .ok();
+      }
+
+      current_subscriptions = new_subscriptions;
     }
   };
 
@@ -300,13 +362,15 @@ async fn async_main() -> anyhow::Result<()> {
               .optional()
           })
           .await?;
+          let now = Instant::now();
           half_established_sessions.borrow_mut().insert(
             device_key,
             DeviceState {
               public_key_hash,
               peer: Rc::new(RefCell::new(peer)),
               topic: topic.as_deref().map(Rc::from),
-              created_at: Instant::now(),
+              created_at: now,
+              last_active_at: now,
             },
           );
 
@@ -345,7 +409,9 @@ async fn async_main() -> anyhow::Result<()> {
               }
             }
             if let Some(key) = key_to_refresh {
-              sessions.get_refresh(&key);
+              if let Some(x) = sessions.get_refresh(&key) {
+                x.last_active_at = Instant::now();
+              }
             }
           }
 
@@ -384,7 +450,7 @@ async fn async_main() -> anyhow::Result<()> {
           }
 
           let ok = mqtt_tx
-            .try_send(MqttMessage {
+            .try_send(MqttMessage::Publish {
               data: message.into(),
               topic: topic.clone(),
             })
@@ -404,8 +470,11 @@ async fn async_main() -> anyhow::Result<()> {
       let Some(msg) = mqtt_rx.next().await else {
         break;
       };
+      let MqttMessage::Publish { topic, data } = msg else {
+        continue;
+      };
       let db2 = db.clone();
-      let topic = msg.topic.to_string();
+      let topic = topic.to_string();
       let public_key_hashes = blocking::unblock(move || {
         db2
           .lock()
@@ -427,29 +496,40 @@ async fn async_main() -> anyhow::Result<()> {
       })
       .await?;
       let mut target_devices: Vec<(SocketAddr, Rc<RefCell<MorfPeer>>)> = vec![];
+      let now = Instant::now();
       for entry in sessions.borrow().iter() {
-        if public_key_hashes.contains(&entry.1.public_key_hash) {
+        let recently_active = now < entry.1.last_active_at
+          || now.duration_since(entry.1.last_active_at) < Duration::from_secs(10);
+        if recently_active && public_key_hashes.contains(&entry.1.public_key_hash) {
           target_devices.push((entry.0 .0, entry.1.peer.clone()));
         }
       }
 
       for (addr, peer) in &target_devices {
-        let mut packet = [&[0u8; 3], &msg.data[..], &[0u8; 16]].concat();
-        let Ok(res) = peer.borrow_mut().seal(&mut packet[3..3 + msg.data.len()]) else {
+        let mut packet = [&[0u8; 3], &data[..], &[0u8; 16]].concat();
+        let Ok(res) = peer.borrow_mut().seal(&mut packet[3..3 + data.len()]) else {
           continue;
         };
         let (prefix, suffix): ([u8; 3], [u8; 16]) = res;
         packet[..3].copy_from_slice(&prefix);
-        packet[3 + msg.data.len()..].copy_from_slice(&suffix);
+        packet[3 + data.len()..].copy_from_slice(&suffix);
 
         let _ = uplink.send_to(packet, *addr).await;
       }
+
+      tracing::info!(
+        num_devices = target_devices.len(),
+        "dispatched mqtt message"
+      );
     }
     Ok::<_, anyhow::Error>(())
   };
 
   futures::select_biased! {
     _ = session_eviction_work.fuse() => unreachable!(),
+    e = enforce_future_type(subscription_dispatch_work).fuse() => {
+      e.with_context(|| "subscription_dispatch failed")?;
+    }
     e = enforce_future_type(morf2mqtt_work).fuse() => {
       e.with_context(|| "morf2mqtt failed")?;
     }
